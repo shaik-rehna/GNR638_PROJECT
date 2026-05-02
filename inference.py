@@ -4,15 +4,20 @@ import csv
 import re
 import torch
 import time
-import random
 import torch.nn.functional as F
 from PIL import Image
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import AutoProcessor
 from qwen_vl_utils import process_vision_info
+
+try:
+    from transformers import Qwen2_5_VLForConditionalGeneration as QwenVLModel
+except ImportError:
+    from transformers import Qwen2VLForConditionalGeneration as QwenVLModel
 
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 CONFIDENCE_THRESHOLD = 0.01
+MAX_IMAGE_SIDE = 1200
 
 SYSTEM_PROMPT = """You are an expert in deep learning, CNNs, and machine learning with PhD-level knowledge.
 
@@ -59,79 +64,89 @@ End your response with exactly: "Answer: X" where X is 1, 2, 3, or 4.
 
 If the image is unreadable or the question makes no sense, do NOT write "Answer:" at all."""
 
+
 def load_model():
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    local_25 = os.path.join(script_dir, "Qwen2.5-VL-7B-Instruct")
     local_7b = os.path.join(script_dir, "Qwen2-VL-7B-Instruct")
 
-    if not os.path.exists(local_7b):
+    if os.path.exists(local_25):
+        model_path = local_25
+    elif os.path.exists(local_7b):
+        model_path = local_7b
+    else:
         raise RuntimeError("Model not found locally. Did setup.bash run?")
 
-    model_path = local_7b
     print(f"Loading model from: {model_path}")
 
-    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    n_gpus = torch.cuda.device_count()
+    if n_gpus >= 2:
+        max_memory = {i: "13GiB" for i in range(n_gpus)}
+        max_memory["cpu"] = "20GiB"
+    elif n_gpus == 1:
+        max_memory = {0: "13GiB", "cpu": "20GiB"}
+    else:
+        max_memory = None
 
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
+    model = QwenVLModel.from_pretrained(
         model_path,
-        torch_dtype=dtype,
+        torch_dtype=torch.bfloat16,
         device_map="auto",
+        max_memory=max_memory,
     )
-    
-    processor = AutoProcessor.from_pretrained(model_path, use_fast=False)
-
+    processor = AutoProcessor.from_pretrained(model_path)
     return model, processor
 
 
-
 def get_logprob_answer(inputs, model, processor):
-    """Chain-of-thought greedy pass, then check digit probability against FULL vocabulary."""
-    digit_token_ids = [
-        processor.tokenizer.encode(str(d), add_special_tokens=False)[0]
-        for d in range(1, 5)
-    ]
+    """CoT greedy pass with output_scores; confidence = full-vocab prob of the digit
+    at the exact generation step where the model wrote 'Answer: X'."""
+    digit_token_map = {}
+    for d in range(1, 5):
+        for surface in [str(d), " " + str(d)]:
+            tids = processor.tokenizer.encode(surface, add_special_tokens=False)
+            if len(tids) == 1:
+                digit_token_map[tids[0]] = d
 
     with torch.no_grad():
-        cot_output = model.generate(
+        gen = model.generate(
             **inputs,
-            max_new_tokens=200,
+            max_new_tokens=400,
             do_sample=False,
             temperature=None,
             top_p=None,
+            output_scores=True,
+            return_dict_in_generate=True,
         )
 
-    cot_trimmed = [
-        out_ids[len(in_ids):]
-        for in_ids, out_ids in zip(inputs.input_ids, cot_output)
-    ]
-    cot_text = processor.batch_decode(cot_trimmed, skip_special_tokens=True)[0].strip()
+    input_len = inputs.input_ids.shape[1]
+    generated_ids = gen.sequences[0][input_len:].tolist()
+    scores = gen.scores
 
-   
-    answer_suffix = processor.tokenizer.encode("\nAnswer:", add_special_tokens=False, return_tensors="pt")[0].to(inputs.input_ids.device)
-    full_ids = torch.cat([cot_output[0], answer_suffix]).unsqueeze(0)
+    cot_text = processor.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
-    with torch.no_grad():
-        logits = model(input_ids=full_ids).logits[0, -1]  # shape: [vocab_size]
+    answer = None
+    confidence = 0.0
+    for i, tid in enumerate(generated_ids):
+        if tid in digit_token_map:
+            prev_text = processor.tokenizer.decode(generated_ids[:i], skip_special_tokens=True)
+            if re.search(r'Answer:\s*$', prev_text):
+                answer = digit_token_map[tid]
+                probs = F.softmax(scores[i][0], dim=0)
+                confidence = probs[tid].item()
+                break
 
-    full_probs = F.softmax(logits, dim=0)
-    digit_probs = [full_probs[tid].item() for tid in digit_token_ids]
+    return cot_text, answer, confidence
 
-    best_idx = int(torch.tensor(digit_probs).argmax().item())
-    best_prob = digit_probs[best_idx]
-    best_digit = best_idx + 1
-
-    return cot_text, best_digit, best_prob
-
-def extract_answer_from_cot(cot_text):
-    match = re.search(r"Answer:\s*([1-4])", cot_text)
-    if match:
-        return int(match.group(1))
-    match = re.search(r"Answer:\s*([A-D])", cot_text, re.IGNORECASE)
-    if match:
-        return "ABCD".index(match.group(1).upper()) + 1
-    return None
 
 def predict_answer(image_path, model, processor):
     image = Image.open(image_path).convert("RGB")
+    if max(image.size) > MAX_IMAGE_SIDE:
+        ratio = MAX_IMAGE_SIDE / max(image.size)
+        image = image.resize(
+            (int(image.size[0] * ratio), int(image.size[1] * ratio)),
+            Image.LANCZOS,
+        )
 
     messages = [
         {
@@ -156,20 +171,15 @@ def predict_answer(image_path, model, processor):
 
     cot_text, answer, confidence = get_logprob_answer(inputs, model, processor)
 
-    # PRIMARY: use what the model explicitly wrote
-    cot_answer = extract_answer_from_cot(cot_text)
-    if cot_answer is not None:
-        return cot_answer
-
-    # FALLBACK: logprob signal
-    if confidence >= CONFIDENCE_THRESHOLD:
+    # PRIMARY: model explicitly wrote "Answer: X" with sufficient confidence
+    if answer is not None and confidence >= CONFIDENCE_THRESHOLD:
         return answer
 
-    return 5  
-    
+    # FALLBACK: skip
+    return 5
+
 
 def main():
-   
     parser = argparse.ArgumentParser()
     parser.add_argument("--test_dir", type=str, required=True, help="Path to test directory")
     args = parser.parse_args()
@@ -188,7 +198,7 @@ def main():
     print(f"Found {len(image_names)} images to process")
 
     # Load model
-    print("Loading Qwen2-VL-7B model...")
+    print("Loading Qwen2.5-VL-7B model...")
     model, processor = load_model()
     print("Model loaded successfully")
 
@@ -207,8 +217,8 @@ def main():
 
         if not os.path.exists(image_path):
             print(f"Warning: {image_path} not found, skipping (marking as 5)")
-            results.append({"id": image_name, 
-                            "image_name": image_name, 
+            results.append({"id": image_name,
+                            "image_name": image_name,
                             "option": 5})
             continue
 
@@ -233,7 +243,7 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     submission_path = os.path.join(script_dir, "submission.csv")
 
-    with open("submission.csv", "w", newline="") as f:
+    with open(submission_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["id", "image_name", "option"])
         writer.writeheader()
         writer.writerows(results)
