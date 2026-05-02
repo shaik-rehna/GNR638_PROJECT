@@ -6,7 +6,7 @@
 - 23B4207
 
 ## Approach
-We use **Qwen2.5-VL-7B-Instruct**, a Vision Language Model (VLM) that can read and reason about images containing text. The model reads each MCQ image, applies chain-of-thought reasoning with deep learning domain knowledge, and outputs the correct answer (1-4) or 5 to skip if uncertain.
+We use **Qwen2-VL-7B-Instruct**, a Vision Language Model (VLM) that can read and reason about images containing text. The model reads each MCQ image, applies chain-of-thought reasoning with deep learning domain knowledge, and outputs the correct answer (1-4) or 5 to skip if uncertain.
 
 ## Environment Setup
 Run the setup script (internet required):
